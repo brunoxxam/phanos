@@ -1,0 +1,16 @@
+{
+  "name": "phanos-fixture-app",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "preinstall": "node -e \"console.log('root preinstall hook')\"",
+    "postinstall": "node -e \"console.log('root postinstall hook')\"",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "left-pad": "1.0.0"
+  },
+  "devDependencies": {
+    "is-odd": "3.0.1"
+  }
+}
