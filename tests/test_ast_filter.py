@@ -44,3 +44,28 @@ def test_clean_script_is_not_flagged() -> None:
     assert result.is_suspicious is False
     assert result.matched_triggers == []
     assert result.condensed_payload == ""
+
+
+def test_detects_multiline_split_bypass_patterns() -> None:
+    analyzer = ASTFilter()
+    source = (
+        "const cp = require(\n"
+        "  'child_process'\n"
+        ");\n"
+        "const secret = process[\n"
+        "  'env'\n"
+        "]['TOKEN'];\n"
+        "const part1 = 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=';\n"
+        "const part2 = 'YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=';\n"
+        "const payload = part1 + part2;\n"
+        "cp[\n"
+        "  'exec'\n"
+        "]('node run.js');\n"
+    )
+
+    result = analyzer.analyze("node setup.js", source)
+
+    assert result.is_suspicious is True
+    assert any(trigger.startswith("execution:") for trigger in result.matched_triggers)
+    assert any(trigger.startswith("environment:") for trigger in result.matched_triggers)
+    assert "obfuscation:high_entropy_token" in result.matched_triggers

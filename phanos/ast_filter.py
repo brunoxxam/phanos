@@ -16,18 +16,50 @@ RISKY_ARGUMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(-enc|-encodedcommand)\b", re.IGNORECASE),
     re.compile(r"\b(iwr|invoke-webrequest)\b", re.IGNORECASE),
 )
-NETWORK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(fetch|axios|http|https|request|socket|net)\b", re.IGNORECASE),
+TOKEN_PATTERN = re.compile(
+    r"""
+    [A-Za-z_][A-Za-z0-9_]*   # identifiers
+    | "(?:\\.|[^"\\])*"      # double-quoted strings
+    | '(?:\\.|[^'\\])*'      # single-quoted strings
+    | `(?:\\.|[^`\\])*`      # template strings
+    | [0-9]+                 # integers
+    | \.\.\.                 # spread
+    | [\[\]\(\)\{\}\.,;:+\-*/%<>=!&|^~?:]  # punctuation/operators
+    """,
+    re.VERBOSE | re.DOTALL,
 )
-EXECUTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(child_process|exec|spawn|eval|function\s*\(|new\s+Function)\b", re.IGNORECASE),
-    re.compile(r"\b(os\.system|subprocess|popen)\b", re.IGNORECASE),
-)
-FILESYSTEM_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(fs|path|Buffer|open\(|writeFile|unlink|chmod)\b", re.IGNORECASE),
-)
-ENVIRONMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(process\.env|os\.environ)\b", re.IGNORECASE),
+
+STRUCTURAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "network": (
+        re.compile(r"\b(?:fetch|axios|request|socket|net|http|https)\b", re.IGNORECASE),
+    ),
+    "execution": (
+        re.compile(r"\brequire\s*\(\s*['\"]child_process['\"]\s*\)"),
+        re.compile(r"\b(?:exec|spawn|execSync|spawnSync)\s*\(", re.IGNORECASE),
+        re.compile(r"\[\s*['\"](?:exec|spawn|execSync|spawnSync)['\"]\s*\]\s*\(", re.IGNORECASE),
+        re.compile(r"\b(?:eval|Function)\s*\(", re.IGNORECASE),
+        re.compile(r"\b(?:os\.system|subprocess|popen)\b", re.IGNORECASE),
+    ),
+    "filesystem": (
+        re.compile(r"\brequire\s*\(\s*['\"]fs['\"]\s*\)"),
+        re.compile(r"\b(?:fs|path|Buffer|writeFile|unlink|chmod)\b", re.IGNORECASE),
+    ),
+    "environment": (
+        re.compile(r"\bprocess\s*(?:\.|\[\s*['\"])env\b", re.IGNORECASE),
+        re.compile(r"\bos\s*(?:\.|\[\s*['\"])environ\b", re.IGNORECASE),
+    ),
+}
+
+ASSIGNMENT_PATTERN = re.compile(
+    r"""
+    (?:
+        \b(?:const|let|var)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*
+        |
+        [A-Za-z_][A-Za-z0-9_]*\s*=\s*
+    )
+    (?P<value>[^;\n]+)
+    """,
+    re.VERBOSE,
 )
 BASE64_BLOB_PATTERN = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
 HEX_BLOB_PATTERN = re.compile(r"\b(?:0x)?[A-Fa-f0-9]{32,}\b")
@@ -45,7 +77,7 @@ class ASTFilterResult(BaseModel):
 
 
 class ASTFilter:
-    """Heuristic scanner for lifecycle hooks and inline script snippets."""
+    """Token-stream scanner for lifecycle hooks and inline script snippets."""
 
     def analyze(self, hook_command: str, source_code: str | None = None) -> ASTFilterResult:
         command_findings = self._scan_command(hook_command)
@@ -90,46 +122,46 @@ class ASTFilter:
         return {"triggers": triggers, "payload_lines": payload_lines}
 
     def _scan_snippets(self, source_code: str) -> dict[str, list[str]]:
+        return self._scan_structural_tokens(source_code)
+
+    def _scan_structural_tokens(self, source_code: str) -> dict[str, list[str]]:
         triggers: list[str] = []
         payload_lines: list[str] = []
-        for line in source_code.splitlines():
-            matched = False
-            for category, patterns in (
-                ("network", NETWORK_PATTERNS),
-                ("execution", EXECUTION_PATTERNS),
-                ("filesystem", FILESYSTEM_PATTERNS),
-                ("environment", ENVIRONMENT_PATTERNS),
-            ):
-                for pattern in patterns:
-                    if pattern.search(line):
-                        triggers.append(f"{category}:{pattern.pattern}")
-                        matched = True
-                        break
-                if matched:
-                    break
-            if matched:
-                payload_lines.append(line.rstrip())
+
+        normalized_stream = self._normalize_code_stream(source_code)
+        for category, patterns in STRUCTURAL_PATTERNS.items():
+            for pattern in patterns:
+                for match in pattern.finditer(normalized_stream):
+                    triggers.append(f"{category}:{pattern.pattern}")
+                    payload_lines.append(self._capture_context(normalized_stream, match.start(), 180))
 
         return {"triggers": triggers, "payload_lines": payload_lines}
 
     def _scan_obfuscation(self, source_code: str) -> dict[str, list[str]]:
         triggers: list[str] = []
         payload_lines: list[str] = []
-        for line in source_code.splitlines():
-            if BASE64_BLOB_PATTERN.search(line):
-                triggers.append("obfuscation:base64_blob")
-                payload_lines.append(line.rstrip())
-            if HEX_BLOB_PATTERN.search(line):
-                triggers.append("obfuscation:hex_blob")
-                payload_lines.append(line.rstrip())
-            if RANDOMIZED_VAR_PATTERN.search(line):
-                triggers.append("obfuscation:randomized_identifier")
-                payload_lines.append(line.rstrip())
 
-            token = self._highest_entropy_token(line)
+        normalized_stream = self._normalize_code_stream(source_code)
+        assignment_blocks = [match.group("value") for match in ASSIGNMENT_PATTERN.finditer(source_code)]
+        chunks = assignment_blocks if assignment_blocks else [source_code]
+        consolidated_chunks = self._build_consolidated_chunks(chunks)
+
+        if BASE64_BLOB_PATTERN.search(normalized_stream):
+            triggers.append("obfuscation:base64_blob")
+            payload_lines.append(self._capture_match(BASE64_BLOB_PATTERN, normalized_stream))
+        if HEX_BLOB_PATTERN.search(normalized_stream):
+            triggers.append("obfuscation:hex_blob")
+            payload_lines.append(self._capture_match(HEX_BLOB_PATTERN, normalized_stream))
+        if RANDOMIZED_VAR_PATTERN.search(normalized_stream):
+            triggers.append("obfuscation:randomized_identifier")
+            payload_lines.append(self._capture_match(RANDOMIZED_VAR_PATTERN, normalized_stream))
+
+        for chunk in consolidated_chunks:
+            token = self._highest_entropy_token(chunk)
             if token is not None and self._shannon_entropy(token) >= ENTROPY_THRESHOLD:
                 triggers.append("obfuscation:high_entropy_token")
-                payload_lines.append(line.rstrip())
+                payload_lines.append(chunk.strip()[:220])
+                break
 
         return {"triggers": triggers, "payload_lines": payload_lines}
 
@@ -150,6 +182,36 @@ class ASTFilter:
         if not tokens:
             return None
         return max(tokens, key=self._shannon_entropy)
+
+    def _build_consolidated_chunks(self, chunks: list[str]) -> list[str]:
+        consolidated: list[str] = []
+        for chunk in chunks:
+            normalized = self._normalize_code_stream(chunk)
+            if normalized:
+                consolidated.append(normalized)
+        if consolidated:
+            consolidated.append("".join(consolidated))
+        return consolidated
+
+    def _normalize_code_stream(self, source_code: str) -> str:
+        tokens = TOKEN_PATTERN.findall(source_code)
+        if not tokens:
+            return source_code
+
+        stream = " ".join(tokens)
+        stream = re.sub(r"\s*([()\[\]{}.,;:+\-*/%<>=!&|^~?:])\s*", r"\1", stream)
+        return stream
+
+    def _capture_context(self, stream: str, start: int, width: int) -> str:
+        left = max(0, start - width // 2)
+        right = min(len(stream), start + width // 2)
+        return stream[left:right].strip()
+
+    def _capture_match(self, pattern: re.Pattern[str], stream: str) -> str:
+        match = pattern.search(stream)
+        if match is None:
+            return ""
+        return self._capture_context(stream, match.start(), 220)
 
     def _shannon_entropy(self, text: str) -> float:
         if not text:
