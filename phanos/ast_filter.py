@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import re
 import shlex
-from dataclasses import dataclass, field
+from collections import Counter
+
+from pydantic import BaseModel, Field
 
 RISKY_BINARIES: tuple[str, ...] = ("curl", "wget", "sh", "bash", "nc", "powershell")
 RISKY_ARGUMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -26,26 +29,40 @@ FILESYSTEM_PATTERNS: tuple[re.Pattern[str], ...] = (
 ENVIRONMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(process\.env|os\.environ)\b", re.IGNORECASE),
 )
+BASE64_BLOB_PATTERN = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+HEX_BLOB_PATTERN = re.compile(r"\b(?:0x)?[A-Fa-f0-9]{32,}\b")
+RANDOMIZED_VAR_PATTERN = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]{20,}\b")
+ENTROPY_MIN_LENGTH = 24
+ENTROPY_THRESHOLD = 4.3
 
 
-@dataclass
-class FilterScan:
-    """Baseline structural scan result before probabilistic heuristics."""
+class ASTFilterResult(BaseModel):
+    """Structured payload returned by the static filter stage."""
 
     is_suspicious: bool = False
-    matched_triggers: list[str] = field(default_factory=list)
+    matched_triggers: list[str] = Field(default_factory=list)
     condensed_payload: str = ""
 
 
 class ASTFilter:
     """Heuristic scanner for lifecycle hooks and inline script snippets."""
 
-    def analyze(self, hook_command: str, source_code: str | None = None) -> FilterScan:
+    def analyze(self, hook_command: str, source_code: str | None = None) -> ASTFilterResult:
         command_findings = self._scan_command(hook_command)
-        snippet_findings = self._scan_snippets(source_code or hook_command)
-        triggers = self._dedupe(command_findings["triggers"] + snippet_findings["triggers"])
-        payload = self._build_payload(command_findings["payload_lines"], snippet_findings["payload_lines"])
-        return FilterScan(
+        scan_source = source_code or hook_command
+        snippet_findings = self._scan_snippets(scan_source)
+        obfuscation_findings = self._scan_obfuscation(scan_source)
+        triggers = self._dedupe(
+            command_findings["triggers"]
+            + snippet_findings["triggers"]
+            + obfuscation_findings["triggers"]
+        )
+        payload = self._build_payload(
+            command_findings["payload_lines"],
+            snippet_findings["payload_lines"],
+            obfuscation_findings["payload_lines"],
+        )
+        return ASTFilterResult(
             is_suspicious=bool(triggers),
             matched_triggers=triggers,
             condensed_payload=payload,
@@ -95,11 +112,54 @@ class ASTFilter:
 
         return {"triggers": triggers, "payload_lines": payload_lines}
 
-    def _build_payload(self, command_lines: list[str], snippet_lines: list[str]) -> str:
-        lines = self._dedupe([line for line in [*command_lines, *snippet_lines] if line.strip()])
+    def _scan_obfuscation(self, source_code: str) -> dict[str, list[str]]:
+        triggers: list[str] = []
+        payload_lines: list[str] = []
+        for line in source_code.splitlines():
+            if BASE64_BLOB_PATTERN.search(line):
+                triggers.append("obfuscation:base64_blob")
+                payload_lines.append(line.rstrip())
+            if HEX_BLOB_PATTERN.search(line):
+                triggers.append("obfuscation:hex_blob")
+                payload_lines.append(line.rstrip())
+            if RANDOMIZED_VAR_PATTERN.search(line):
+                triggers.append("obfuscation:randomized_identifier")
+                payload_lines.append(line.rstrip())
+
+            token = self._highest_entropy_token(line)
+            if token is not None and self._shannon_entropy(token) >= ENTROPY_THRESHOLD:
+                triggers.append("obfuscation:high_entropy_token")
+                payload_lines.append(line.rstrip())
+
+        return {"triggers": triggers, "payload_lines": payload_lines}
+
+    def _build_payload(
+        self,
+        command_lines: list[str],
+        snippet_lines: list[str],
+        obfuscation_lines: list[str],
+    ) -> str:
+        lines = self._dedupe(
+            [line for line in [*command_lines, *snippet_lines, *obfuscation_lines] if line.strip()]
+        )
         return "\n".join(lines)
 
-    def _dedupe(self, values: list[str]) -> list[str]:
+    def _highest_entropy_token(self, line: str) -> str | None:
+        token_pattern = re.compile(rf"[A-Za-z0-9+/=]{{{ENTROPY_MIN_LENGTH},}}")
+        tokens = token_pattern.findall(line)
+        if not tokens:
+            return None
+        return max(tokens, key=self._shannon_entropy)
+
+    def _shannon_entropy(self, text: str) -> float:
+        if not text:
+            return 0.0
+        length = len(text)
+        frequencies = Counter(text)
+        return -sum((count / length) * math.log2(count / length) for count in frequencies.values())
+
+    @staticmethod
+    def _dedupe(values: list[str]) -> list[str]:
         seen: set[str] = set()
         deduped: list[str] = []
         for value in values:
