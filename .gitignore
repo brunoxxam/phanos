@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 sandbox-out*/
 phanos-sandbox-*/
+docs/
