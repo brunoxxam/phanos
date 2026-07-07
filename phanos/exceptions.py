@@ -23,3 +23,7 @@ class PackageDownloadError(PhanosError):
 
 class SandboxError(PhanosError):
     """Raised when the isolated sandbox directory cannot be created or written."""
+
+
+class OllamaConnectionError(PhanosError):
+    """Raised when the local Ollama daemon cannot be reached or does not respond."""
